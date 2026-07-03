@@ -503,7 +503,7 @@ class SPANN_model:
     :device: device on which SPAMM model is aranged
 
     """
-    def __init__(self, x_dim, z_dim, enc, dec, class_num, device, n_gmm_clusters=None):
+    def __init__(self, x_dim, z_dim, enc, dec, class_num, device):
         super().__init__()
         self.class_num = class_num
         self.device = device
@@ -513,10 +513,7 @@ class SPANN_model:
         self.decoder = Decoder(z_dim, dec).to(device)
         self.classifier = CLS(z_dim, class_num).to(device)
         
-        if n_gmm_clusters is None:
-            n_gmm_clusters = class_num
-            
-        self.gmm_prior = GMMPrior(latent_dim=z_dim, n_clusters=n_gmm_clusters).to(device)
+        self.gmm_prior = GMMPrior(latent_dim=z_dim, num_known_classes=class_num).to(device)
 
     def train(
         self,
@@ -864,20 +861,18 @@ class SPANN_model:
                                     torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
                                 )
 
-                            # --- SỬA ĐỔI: Dùng trực tiếp dự đoán của GMM để tìm Novel Cells ---
+                            # --- TÍCH HỢP GMM VÀO SPANN ĐỂ TÌM NOVEL CELLS ---
                             _, gamma_t = self.gmm_prior(z_target, mu_target, var_target, labels=None)
                             gmm_preds = torch.argmax(gamma_t, dim=1)
-                            
-                            # Tế bào là Novel nếu:
-                            # 1. Escore thấp (Cơ chế cũ của SPANN)
-                            # HOẶC 2. GMM xếp nó vào cụm K+1 (Cơ chế VaDE, self.class_num chính là index của cụm K+1)
+    
+                            # Tế bào là Novel nếu: 
+                            # (1) Bị SPANN đánh dấu Escore thấp HOẶC
+                            # (2) Bị GMM đẩy vào Cụm Nền (index == self.class_num)
                             is_unknown = (Escore_t < threshold_test) | (gmm_preds == self.class_num)
-                            
+    
                             pred_unknown_id = torch.nonzero(is_unknown).view(-1)
                             pred_known_id = torch.nonzero(~is_unknown).view(-1)
-                            # ------------------------------------------------------------------
-                            pseudo_label_t_cls[pred_unknown_id] = -1
-                            pseudo_label_t_ot[pred_unknown_id] = -1
+                            # ---------------------------------------------------
                             ##先分known和unknown 对known做ot 避免unknown的样本加进去不符合beta的分布
                             sim_tar_high_conf = torch.matmul(norm_feat_t[pred_known_id], source_prototype.t())
                             if sim_tar_high_conf.size()[0] > 0:
@@ -1291,18 +1286,18 @@ class SPANN_model:
                                     torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
                                 )
 
-                            # --- SỬA ĐỔI: Dùng trực tiếp dự đoán của GMM để tìm Novel Cells ---
+                            # --- TÍCH HỢP GMM VÀO SPANN ĐỂ TÌM NOVEL CELLS ---
                             _, gamma_t = self.gmm_prior(z_target, mu_target, var_target, labels=None)
                             gmm_preds = torch.argmax(gamma_t, dim=1)
-                            
-                            # Tế bào là Novel nếu:
-                            # 1. Escore thấp (Cơ chế cũ của SPANN)
-                            # HOẶC 2. GMM xếp nó vào cụm K+1 (Cơ chế VaDE, self.class_num chính là index của cụm K+1)
+
+                            # Tế bào là Novel nếu: 
+                            # (1) Bị SPANN đánh dấu Escore thấp HOẶC
+                            # (2) Bị GMM đẩy vào Cụm Nền (index == self.class_num)
                             is_unknown = (Escore_t < threshold_test) | (gmm_preds == self.class_num)
-                            
+    
                             pred_unknown_id = torch.nonzero(is_unknown).view(-1)
                             pred_known_id = torch.nonzero(~is_unknown).view(-1)
-                            # ------------------------------------------------------------------
+                             # ---------------------------------------------------
                             pseudo_label_t_cls[pred_unknown_id] = -1
                             pseudo_label_t_ot[pred_unknown_id] = -1
                             ##先分known和unknown 对known做ot 避免unknown的样本加进去不符合beta的分布
