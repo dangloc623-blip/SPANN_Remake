@@ -23,53 +23,33 @@ class GMMPrior(nn.Module):
         # var_c: Phương sai của mỗi cụm (lưu ý: để tối ưu tốt hơn, thường giữ log_var thay vì var)
         self.logvar_c = nn.Parameter(torch.zeros(n_clusters, latent_dim))
 
-    def forward(self, z, mu, logvar):
-        """
-        Tính toán KL Divergence dựa trên GMM.
-        
-        Args:
-            z (Tensor): Latent vector sau khi reparameterization [Batch_size, latent_dim]
-            mu (Tensor): Mean từ Encoder [Batch_size, latent_dim]
-            logvar (Tensor): Log variance từ Encoder [Batch_size, latent_dim]
-            
-        Returns:
-            loss_kl_gmm (Tensor): Giá trị Loss KL để cộng vào hàm mục tiêu
-            gamma (Tensor): Xác suất điểm dữ liệu thuộc về từng cụm [Batch_size, n_clusters]
-        """
+    def forward(self, z, mu, logvar, labels=None):
         batch_size = z.size(0)
-        
-        # Đảm bảo pi là một phân phối xác suất hợp lệ (tổng = 1)
         log_pi = torch.log_softmax(self.pi, dim=0)
         var_c = torch.exp(self.logvar_c)
 
-        # ---------------------------------------------------------
-        # BƯỚC E (Expectation): Tính xác suất hậu nghiệm gamma_c = p(c|z)
-        # ---------------------------------------------------------
-        # Mở rộng chiều để broadcasting: [Batch_size, K, latent_dim]
         z_expand = z.unsqueeze(1)
         mu_c_expand = self.mu_c.unsqueeze(0)
         var_c_expand = var_c.unsqueeze(0)
 
-        # Tính log p(z|c)
         log_p_z_c = -0.5 * torch.sum(
             torch.log(2 * math.pi * var_c_expand) + 
             ((z_expand - mu_c_expand) ** 2) / var_c_expand, 
             dim=2
         )
-
-        # Tính log( p(c) * p(z|c) )
         log_p_c_z = log_pi + log_p_z_c
         
-        # Chuẩn hóa để lấy xác suất gamma (tránh underflow bằng logsumexp)
-        gamma = torch.softmax(log_p_c_z, dim=1) 
+        if labels is not None:
+            # [BÁN GIÁM SÁT] Neo cứng xác suất bằng nhãn thật cho tập Source
+            gamma = torch.zeros(batch_size, self.n_clusters, device=z.device)
+            # labels.unsqueeze(1) chứa index từ 0 đến K-1
+            gamma.scatter_(1, labels.unsqueeze(1), 1.0)
+        else:
+            # [PHI GIÁM SÁT] Tự động phân cụm cho tập Target (có cơ hội rơi vào cụm K+1)
+            gamma = torch.softmax(log_p_c_z, dim=1) 
 
-        # ---------------------------------------------------------
-        # Tính KL Divergence (D_KL) cho VaDE
-        # ---------------------------------------------------------
-        # 1. Thành phần rời rạc: KL(gamma || pi)
         kl_discrete = torch.sum(gamma * (torch.log(gamma + 1e-10) - log_pi), dim=1)
 
-        # 2. Thành phần liên tục: gamma * KL( N(mu, var) || N(mu_c, var_c) )
         mu_expand = mu.unsqueeze(1)
         logvar_expand = logvar.unsqueeze(1)
         var_expand = torch.exp(logvar_expand)
@@ -83,7 +63,5 @@ class GMMPrior(nn.Module):
             dim=1
         )
 
-        # Tổng hợp Loss (trung bình trên batch)
         loss_kl_gmm = torch.mean(kl_discrete + kl_continuous)
-
         return loss_kl_gmm, gamma
