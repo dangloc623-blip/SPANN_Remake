@@ -703,32 +703,41 @@ class SPANN_model:
                             spa_loss /= num_high_conf
 
                     # cell type ot alignment
-                    if beta is None:
-                        beta = ot.unif(source_prototype.size()[0])
-                    #             sim = torch.matmul(norm_feat_t, source_prototype.t())
-                    sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
+                    # --- VÁ LỖI TRÀN NAN TRONG CCD LOSS ---
+                    if high_conf_idx.sum() > 0:
+                        # cell type ot alignment
+                        if beta is None:
+                            beta = ot.unif(source_prototype.size()[0])
+                            
+                        sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
 
-                    # UOT-based CCD
-                    pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(sim, beta, device=self.device)
-                    pseudo_label_t_soft_high_conf = Q_t * (
-                        (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
-                    )
-                    weight_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i))
-                    # adaptive update for marginal probability vector
-                    if True not in np.isnan(new_beta):
-                        beta = mu * beta + (1 - mu) * new_beta
-                    pred_label_t = torch.argmax(after_lincls_t, axis=1)
-                    pred_label_t_soft = torch.softmax(after_lincls_t, axis=1)
+                        # UOT-based CCD
+                        pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(sim, beta, device=self.device)
+                        
+                        # CHỐNG CHIA CHO 0 KHI TÍNH Q_t
+                        sum_Q = torch.sum(Q_t, 1)
+                        sum_Q[sum_Q == 0] = 1e-10 
+                        pseudo_label_t_soft_high_conf = Q_t * ((1 / sum_Q).unsqueeze(1).expand(-1, Q_t.size()[1]))
+                        
+                        # CHỐNG CHIA CHO 0 KHI TÍNH weight_t (Thêm 1e-10 vào mẫu số)
+                        weight_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-10)
+                        
+                        # adaptive update for marginal probability vector
+                        if True not in np.isnan(new_beta):
+                            beta = mu * beta + (1 - mu) * new_beta
+                            
+                        pred_label_t = torch.argmax(after_lincls_t, axis=1)
+                        pred_label_t_soft = torch.softmax(after_lincls_t, axis=1)
 
-                    if True not in torch.isnan(pseudo_label_t_soft_high_conf):
-                        #                 ccd_loss = -torch.mean((pseudo_label_t_soft_high_conf * pred_label_t_soft[Escore_t > threshold_batch]).sum(-1))#
-                        #                 ccd_loss += torch.mean(weight_t*(-pseudo_label_t_soft_high_conf * torch.log(pred_label_t_soft + 1e-10)).sum(dim=1))
-                        ccd_loss += torch.mean(
-                            weight_t
-                            * (
-                                -pseudo_label_t_soft_high_conf * torch.log(pred_label_t_soft[[high_conf_idx]] + 1e-10)
-                            ).sum(dim=1)
-                        )
+                        if True not in torch.isnan(pseudo_label_t_soft_high_conf):
+                            # SỬA LỖI CÚ PHÁP BẢN GỐC: [[high_conf_idx]] thành [high_conf_idx]
+                            ccd_loss += torch.mean(
+                                weight_t
+                                * (
+                                    -pseudo_label_t_soft_high_conf * torch.log(pred_label_t_soft[high_conf_idx] + 1e-10)
+                                ).sum(dim=1)
+                            )
+                    # --------------------------------------
 
                 # neighbor loss
                 local_loss = torch.tensor(0.0).to(self.device)
@@ -1110,32 +1119,41 @@ class SPANN_model:
                             spa_loss /= num_high_conf
 
                     # cell type ot alignment
-                    if beta is None:
-                        beta = ot.unif(source_prototype.size()[0])
-                    #             sim = torch.matmul(norm_feat_t, source_prototype.t())
-                    sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
+                    # --- VÁ LỖI TRÀN NAN TRONG CCD LOSS ---
+                    if high_conf_idx.sum() > 0:
+                        # cell type ot alignment
+                        if beta is None:
+                            beta = ot.unif(source_prototype.size()[0])
+                            
+                        sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
 
-                    # UOT-based CCD
-                    pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(sim, beta, device=self.device)
-                    pseudo_label_t_soft_high_conf = Q_t * (
-                        (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
-                    )
-                    weight_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i))
-                    # adaptive update for marginal probability vector
-                    if True not in np.isnan(new_beta):
-                        beta = mu * beta + (1 - mu) * new_beta
-                    pred_label_t = torch.argmax(after_lincls_t, axis=1)
-                    pred_label_t_soft = torch.softmax(after_lincls_t, axis=1)
+                        # UOT-based CCD
+                        pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(sim, beta, device=self.device)
+                        
+                        # CHỐNG CHIA CHO 0 KHI TÍNH Q_t
+                        sum_Q = torch.sum(Q_t, 1)
+                        sum_Q[sum_Q == 0] = 1e-10 
+                        pseudo_label_t_soft_high_conf = Q_t * ((1 / sum_Q).unsqueeze(1).expand(-1, Q_t.size()[1]))
+                        
+                        # CHỐNG CHIA CHO 0 KHI TÍNH weight_t (Thêm 1e-10 vào mẫu số)
+                        weight_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-10)
+                        
+                        # adaptive update for marginal probability vector
+                        if True not in np.isnan(new_beta):
+                            beta = mu * beta + (1 - mu) * new_beta
+                            
+                        pred_label_t = torch.argmax(after_lincls_t, axis=1)
+                        pred_label_t_soft = torch.softmax(after_lincls_t, axis=1)
 
-                    if True not in torch.isnan(pseudo_label_t_soft_high_conf):
-                        #                 ccd_loss = -torch.mean((pseudo_label_t_soft_high_conf * pred_label_t_soft[Escore_t > threshold_batch]).sum(-1))#
-                        #                 ccd_loss += torch.mean(weight_t*(-pseudo_label_t_soft_high_conf * torch.log(pred_label_t_soft + 1e-10)).sum(dim=1))
-                        ccd_loss += torch.mean(
-                            weight_t
-                            * (
-                                -pseudo_label_t_soft_high_conf * torch.log(pred_label_t_soft[[high_conf_idx]] + 1e-10)
-                            ).sum(dim=1)
-                        )
+                        if True not in torch.isnan(pseudo_label_t_soft_high_conf):
+                            # SỬA LỖI CÚ PHÁP BẢN GỐC: [[high_conf_idx]] thành [high_conf_idx]
+                            ccd_loss += torch.mean(
+                                weight_t
+                                * (
+                                    -pseudo_label_t_soft_high_conf * torch.log(pred_label_t_soft[high_conf_idx] + 1e-10)
+                                ).sum(dim=1)
+                            )
+                    # --------------------------------------
 
                 # neighbor loss
                 local_loss = torch.tensor(0.0).to(self.device)
