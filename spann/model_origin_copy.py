@@ -864,8 +864,18 @@ class SPANN_model:
                                     torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
                                 )
 
-                            pred_known_id = torch.nonzero(Escore_t >= threshold_test).view(-1)
-                            pred_unknown_id = torch.nonzero(Escore_t < threshold_test).view(-1)
+                            # --- SỬA ĐỔI: Dùng trực tiếp dự đoán của GMM để tìm Novel Cells ---
+                            _, gamma_t = self.gmm_prior(z_target, mu_target, var_target, labels=None)
+                            gmm_preds = torch.argmax(gamma_t, dim=1)
+                            
+                            # Tế bào là Novel nếu:
+                            # 1. Escore thấp (Cơ chế cũ của SPANN)
+                            # HOẶC 2. GMM xếp nó vào cụm K+1 (Cơ chế VaDE, self.class_num chính là index của cụm K+1)
+                            is_unknown = (Escore_t < threshold_test) | (gmm_preds == self.class_num)
+                            
+                            pred_unknown_id = torch.nonzero(is_unknown).view(-1)
+                            pred_known_id = torch.nonzero(~is_unknown).view(-1)
+                            # ------------------------------------------------------------------
                             pseudo_label_t_cls[pred_unknown_id] = -1
                             pseudo_label_t_ot[pred_unknown_id] = -1
                             ##先分known和unknown 对known做ot 避免unknown的样本加进去不符合beta的分布
@@ -1281,8 +1291,18 @@ class SPANN_model:
                                     torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
                                 )
 
-                            pred_known_id = torch.nonzero(Escore_t >= threshold_test).view(-1)
-                            pred_unknown_id = torch.nonzero(Escore_t < threshold_test).view(-1)
+                            # --- SỬA ĐỔI: Dùng trực tiếp dự đoán của GMM để tìm Novel Cells ---
+                            _, gamma_t = self.gmm_prior(z_target, mu_target, var_target, labels=None)
+                            gmm_preds = torch.argmax(gamma_t, dim=1)
+                            
+                            # Tế bào là Novel nếu:
+                            # 1. Escore thấp (Cơ chế cũ của SPANN)
+                            # HOẶC 2. GMM xếp nó vào cụm K+1 (Cơ chế VaDE, self.class_num chính là index của cụm K+1)
+                            is_unknown = (Escore_t < threshold_test) | (gmm_preds == self.class_num)
+                            
+                            pred_unknown_id = torch.nonzero(is_unknown).view(-1)
+                            pred_known_id = torch.nonzero(~is_unknown).view(-1)
+                            # ------------------------------------------------------------------
                             pseudo_label_t_cls[pred_unknown_id] = -1
                             pseudo_label_t_ot[pred_unknown_id] = -1
                             ##先分known和unknown 对known做ot 避免unknown的样本加进去不符合beta的分布
