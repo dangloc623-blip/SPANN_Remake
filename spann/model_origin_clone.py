@@ -16,7 +16,7 @@ from torch.autograd import Function
 from torch.distributions import Beta, Normal, kl_divergence
 from torch.nn import init
 from torch.nn.parameter import Parameter
-
+from vade_prior import VaDEPrior
 
 def kl_div(mu, var, weight=None):
     # calculate kl divergence
@@ -512,7 +512,9 @@ class SPANN_model:
         self.encoder = Encoder(x_dim, enc).to(device)
         self.decoder = Decoder(z_dim, dec).to(device)
         self.classifier = CLS(z_dim, class_num).to(device)
-
+        
+        # [MỚI THÊM] Khởi tạo GMM Prior với số cụm = số class đã biết + 5 cụm dự phòng cho Novel Cells
+        self.gmm_prior = VaDEPrior(n_components=class_num + 5, latent_dim=z_dim).to(device)
     def train(
         self,
         source_cm_dl,
@@ -575,7 +577,9 @@ class SPANN_model:
         optim_enc = torch.optim.Adam(self.encoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_dec = torch.optim.Adam(self.decoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_cls = torch.optim.Adam(self.classifier.parameters(), lr=lr, weight_decay=5e-4)
-
+        # [MỚI THÊM]
+        optim_prior = torch.optim.Adam(self.gmm_prior.parameters(), lr=lr, weight_decay=5e-4)
+        
         target_coor = torch.tensor(np.array(spatial_coor)).to(self.device)
         target_coor = torch.tensor(target_coor, dtype=torch.float)
         target_coor = target_coor / torch.max(target_coor, axis=0)[0]
@@ -622,8 +626,15 @@ class SPANN_model:
 
                 recon_loss += recon_crit(recon_source_c, im_source) + recon_crit(recon_target_c, im_target)
                 recon_loss += 0.5 * (recon_crit(recon_source_s, xs_source) + recon_crit(recon_target_s, xs_target))
+                # [THAY THẾ ĐOẠN KL_LOSS CŨ BẰNG ĐOẠN NÀY]
                 kl_loss = torch.tensor(0.0).to(self.device)
-                kl_loss += kl_div(mu_source, var_source) + kl_div(mu_target, var_target)
+                if iteration < 500:
+                    # Warm-up: Dùng Standard VAE để định hình latent space sơ bộ
+                    kl_loss += kl_div(mu_source, var_source) + kl_div(mu_target, var_target)
+                else:
+                    # Chuyển sang GMM Prior để tách cụm (Tối ưu cho Novel Discovery)
+                    kl_loss += self.gmm_prior.compute_vade_loss(z_source, mu_source, var_source)
+                    kl_loss += self.gmm_prior.compute_vade_loss(z_target, mu_target, var_target)
 
                 # classification loss
                 criterion = CrossEntropyLabelSmooth(self.class_num, device=self.device, epsilon=0.1).to(self.device)
@@ -952,7 +963,8 @@ class SPANN_model:
         optim_enc = torch.optim.Adam(self.encoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_dec = torch.optim.Adam(self.decoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_cls = torch.optim.Adam(self.classifier.parameters(), lr=lr, weight_decay=5e-4)
-
+        optim_prior = torch.optim.Adam(self.gmm_prior.parameters(), lr=lr, weight_decay=5e-4)
+        
         target_coor = torch.tensor(np.array(spatial_coor)).to(self.device)
         target_coor = torch.tensor(target_coor, dtype=torch.float)
         target_coor = target_coor / torch.max(target_coor, axis=0)[0]
@@ -999,8 +1011,15 @@ class SPANN_model:
 
                 recon_loss += recon_crit(recon_source_c, im_source) + recon_crit(recon_target_c, im_target)
                 recon_loss += 0.5 * (recon_crit(recon_source_s, xs_source) + recon_crit(recon_target_s, xs_target))
+                # [THAY THẾ ĐOẠN KL_LOSS CŨ BẰNG ĐOẠN NÀY]
                 kl_loss = torch.tensor(0.0).to(self.device)
-                kl_loss += kl_div(mu_source, var_source) + kl_div(mu_target, var_target)
+                if iteration < 500:
+                    # Warm-up: Dùng Standard VAE để định hình latent space sơ bộ
+                    kl_loss += kl_div(mu_source, var_source) + kl_div(mu_target, var_target)
+                else:
+                    # Chuyển sang GMM Prior để tách cụm (Tối ưu cho Novel Discovery)
+                    kl_loss += self.gmm_prior.compute_vade_loss(z_source, mu_source, var_source)
+                    kl_loss += self.gmm_prior.compute_vade_loss(z_target, mu_target, var_target)
 
                 # classification loss
                 criterion = CrossEntropyLabelSmooth(self.class_num, device=self.device, epsilon=0.1).to(self.device)
