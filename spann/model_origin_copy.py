@@ -629,15 +629,14 @@ class SPANN_model:
                 recon_loss += recon_crit(recon_source_c, im_source) + recon_crit(recon_target_c, im_target)
                 recon_loss += 0.5 * (recon_crit(recon_source_s, xs_source) + recon_crit(recon_target_s, xs_target))
                 # -----------------------------------------------------------------
-                # CHIẾN LƯỢC ASYMMETRIC PRIOR (Tiền nghiệm bất đối xứng)
+                # CHIẾN LƯỢC SEMI-SUPERVISED OPEN-SET VaDE
                 # -----------------------------------------------------------------
-                # 1. Source Domain: Ép cụm bằng GMM Prior (vì đã biết chắc chắn nhãn)
-                loss_kl_source, _ = self.gmm_prior(z_source, mu_source, var_source)
+                # Source: Bắt buộc truyền label_source để neo tâm GMM
+                loss_kl_source, _ = self.gmm_prior(z_source, mu_source, var_source, labels=label_source)
                 
-                # 2. Target Domain: Thả lỏng bằng Standard VAE Prior để Novel Cell không bị ép khuôn
-                loss_kl_target = kl_div(mu_target, var_target)
+                # Target: Truyền None, tế bào lạ sẽ tự do dạt vào Cụm Novel
+                loss_kl_target, _ = self.gmm_prior(z_target, mu_target, var_target, labels=None)
                 
-                # Tổng hợp Loss KL (Có thể tinh chỉnh trọng số giữa 2 domain sau nếu cần)
                 kl_loss = loss_kl_source + loss_kl_target
                 # -----------------------------------------------------------------
 
@@ -1029,15 +1028,14 @@ class SPANN_model:
                 recon_loss += recon_crit(recon_source_c, im_source) + recon_crit(recon_target_c, im_target)
                 recon_loss += 0.5 * (recon_crit(recon_source_s, xs_source) + recon_crit(recon_target_s, xs_target))
                 # -----------------------------------------------------------------
-                # CHIẾN LƯỢC ASYMMETRIC PRIOR (Tiền nghiệm bất đối xứng)
+                # CHIẾN LƯỢC SEMI-SUPERVISED OPEN-SET VaDE
                 # -----------------------------------------------------------------
-                # 1. Source Domain: Ép cụm bằng GMM Prior (vì đã biết chắc chắn nhãn)
-                loss_kl_source, _ = self.gmm_prior(z_source, mu_source, var_source)
+                # Source: Bắt buộc truyền label_source để neo tâm GMM
+                loss_kl_source, _ = self.gmm_prior(z_source, mu_source, var_source, labels=label_source)
                 
-                # 2. Target Domain: Thả lỏng bằng Standard VAE Prior để Novel Cell không bị ép khuôn
-                loss_kl_target = kl_div(mu_target, var_target)
+                # Target: Truyền None, tế bào lạ sẽ tự do dạt vào Cụm Novel
+                loss_kl_target, _ = self.gmm_prior(z_target, mu_target, var_target, labels=None)
                 
-                # Tổng hợp Loss KL (Có thể tinh chỉnh trọng số giữa 2 domain sau nếu cần)
                 kl_loss = loss_kl_source + loss_kl_target
                 # -----------------------------------------------------------------
 
