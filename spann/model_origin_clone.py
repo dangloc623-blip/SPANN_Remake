@@ -672,8 +672,11 @@ class SPANN_model:
                                 torch.tensor([threshold, torch.quantile(Escore_mix_t, (1 - resolution))])
                             )
                     high_conf_idx = Escore_t > threshold
-                    id_target_high_conf = id_target[high_conf_idx]  # [Escore_t>threshold]
-                    batch_coor_high_conf = batch_coor[high_conf_idx]  # [Escore_t>threshold]
+                    
+                    # [FIX GPU-CPU ERROR] Đẩy index về cpu()
+                    high_conf_idx_cpu = high_conf_idx.cpu()
+                    id_target_high_conf = id_target[high_conf_idx_cpu]  
+                    batch_coor_high_conf = batch_coor[high_conf_idx_cpu]
                     # Spatial alignment loss
                     if iteration > miditer3:
                         # Spatial alignment loss
@@ -1057,8 +1060,11 @@ class SPANN_model:
                                 torch.tensor([threshold, torch.quantile(Escore_mix_t, (1 - resolution))])
                             )
                     high_conf_idx = Escore_t > threshold
-                    id_target_high_conf = id_target[high_conf_idx]  # [Escore_t>threshold]
-                    batch_coor_high_conf = batch_coor[high_conf_idx]  # [Escore_t>threshold]
+                    
+                    # [FIX GPU-CPU ERROR] Đẩy index về cpu()
+                    high_conf_idx_cpu = high_conf_idx.cpu()
+                    id_target_high_conf = id_target[high_conf_idx_cpu]  
+                    batch_coor_high_conf = batch_coor[high_conf_idx_cpu]
                     # Spatial alignment loss
                     if iteration > miditer3:
                         # Spatial alignment loss
