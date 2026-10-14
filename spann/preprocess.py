@@ -3,6 +3,8 @@ from collections import Counter
 import numpy as np
 import pandas as pd
 import scanpy as sc
+import scipy.sparse as sp
+import torch
 from sklearn.preprocessing import MaxAbsScaler, maxabs_scale
 from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 
@@ -99,21 +101,25 @@ def anndata_preprocess(adata_spa, adata_rna, highly_variable=2000, spatial_label
 
 class SingleCellDataset(Dataset):
     def __init__(self, data, labels):
-        self.data = data
-        self.labels = labels
-        self.shape = data.shape
+        # Pre-convert sparse matrix to dense float32 array to eliminate row-by-row CSR slicing overhead
+        if sp.issparse(data):
+            self.data = np.asarray(data.toarray(), dtype=np.float32)
+        else:
+            self.data = np.asarray(data, dtype=np.float32)
+        self.labels = np.asarray(labels)
+        self.shape = self.data.shape
 
     def __len__(self):
         return self.data.shape[0]
 
     def __getitem__(self, idx):
-        x = self.data[idx].toarray().squeeze()
-        labels = self.labels[idx].squeeze()
+        x = self.data[idx]
+        labels = self.labels[idx]
 
         return x, labels, idx
 
 
-def generate_dataloaders(adata_cm, adata_spa, adata_rna, batch_size=256):
+def generate_dataloaders(adata_cm, adata_spa, adata_rna, batch_size=256, num_workers=2):
     """
     Generate torch datasets and torch dataloaders from preprocessed AnnData files
 
@@ -121,6 +127,7 @@ def generate_dataloaders(adata_cm, adata_spa, adata_rna, batch_size=256):
     :adata_spa: AnnData file of the preprocessed spatial data
     :adata_rna: AnnData file of the preprocessed scRNA-seq data
     :batch_size: batch size of the dataloaders, default=256
+    :num_workers: number of workers for dataloader (2 is optimal for Kaggle/Colab), default=2
     :return: domain specific genes datasets - source_sp_ds,target_sp_ds, train dataloaders - source_cm_dl,target_cm_dl, test dataloaders - test_source_cm_dl,test_target_cm_dl
     """
     adata_cm_rna = adata_cm[adata_cm.obs["domain_id"] == "1"]
@@ -138,15 +145,18 @@ def generate_dataloaders(adata_cm, adata_spa, adata_rna, batch_size=256):
     source_weights = [class_weight[x] for x in classes]
     sampler = WeightedRandomSampler(source_weights, len(source_cm_ds.labels))
 
+    pin_mem = torch.cuda.is_available()
     source_cm_dl = DataLoader(
-        dataset=source_cm_ds, batch_size=batch_size, sampler=sampler, num_workers=4, drop_last=True
+        dataset=source_cm_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=pin_mem, drop_last=True
     )
-    target_cm_dl = DataLoader(dataset=target_cm_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=True)
+    target_cm_dl = DataLoader(
+        dataset=target_cm_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem, drop_last=True
+    )
     test_source_cm_dl = DataLoader(
-        dataset=source_cm_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False
+        dataset=source_cm_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem, drop_last=False
     )
     test_target_cm_dl = DataLoader(
-        dataset=target_cm_ds, batch_size=batch_size, shuffle=True, num_workers=4, drop_last=False
+        dataset=target_cm_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem, drop_last=False
     )
     return source_sp_ds, target_sp_ds, source_cm_dl, target_cm_dl, test_source_cm_dl, test_target_cm_dl
 
