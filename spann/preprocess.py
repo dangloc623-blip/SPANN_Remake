@@ -146,17 +146,22 @@ def generate_dataloaders(adata_cm, adata_spa, adata_rna, batch_size=256, num_wor
     sampler = WeightedRandomSampler(source_weights, len(source_cm_ds.labels))
 
     pin_mem = torch.cuda.is_available()
+    persistent = (num_workers > 0)
     source_cm_dl = DataLoader(
-        dataset=source_cm_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers, pin_memory=pin_mem, drop_last=True
+        dataset=source_cm_ds, batch_size=batch_size, sampler=sampler, num_workers=num_workers,
+        pin_memory=pin_mem, persistent_workers=persistent, drop_last=True
     )
     target_cm_dl = DataLoader(
-        dataset=target_cm_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers, pin_memory=pin_mem, drop_last=True
+        dataset=target_cm_ds, batch_size=batch_size, shuffle=True, num_workers=num_workers,
+        pin_memory=pin_mem, persistent_workers=persistent, drop_last=True
     )
     test_source_cm_dl = DataLoader(
-        dataset=source_cm_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem, drop_last=False
+        dataset=source_cm_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=pin_mem, persistent_workers=persistent, drop_last=False
     )
     test_target_cm_dl = DataLoader(
-        dataset=target_cm_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers, pin_memory=pin_mem, drop_last=False
+        dataset=target_cm_ds, batch_size=batch_size, shuffle=False, num_workers=num_workers,
+        pin_memory=pin_mem, persistent_workers=persistent, drop_last=False
     )
     return source_sp_ds, target_sp_ds, source_cm_dl, target_cm_dl, test_source_cm_dl, test_target_cm_dl
 

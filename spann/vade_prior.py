@@ -23,14 +23,15 @@ class VaDEPrior(nn.Module):
         z = z.unsqueeze(1) # [Batch, 1, Dim]
         mu = self.mu_c.unsqueeze(0) # [1, Clusters, Dim]
         log_var = self.log_var_c.unsqueeze(0)
+        var_c = torch.exp(log_var) + 1e-8
 
         # log p(z|c)
         log_p_z_c = -0.5 * torch.sum(
-            log_var + (z - mu)**2 / torch.exp(log_var) + math.log(2 * math.pi), dim=2
+            log_var + (z - mu)**2 / var_c + math.log(2 * math.pi), dim=2
         )
         
         # log p(c|z) tỷ lệ thuận với log( p(z|c) * p(c) )
-        log_pi = torch.log(self.get_pi() + 1e-10).unsqueeze(0)
+        log_pi = F.log_softmax(self.pi_logits, dim=0).unsqueeze(0)
         log_p_c_z = log_p_z_c + log_pi
 
         # Chuẩn hóa bằng Softmax để ra gamma (xác suất thuộc từng cụm)
@@ -44,7 +45,7 @@ class VaDEPrior(nn.Module):
         mu_z = mu_z.unsqueeze(1) 
         var_z = var_z.unsqueeze(1)
         mu_c = self.mu_c.unsqueeze(0) 
-        var_c = torch.exp(self.log_var_c).unsqueeze(0)
+        var_c = torch.exp(self.log_var_c).unsqueeze(0) + 1e-8
 
         # 1. KL( q(z|x) || p(z|c) )
         kl_z = 0.5 * torch.sum(
@@ -53,8 +54,8 @@ class VaDEPrior(nn.Module):
         )
 
         # 2. KL( q(c|x) || p(c) )
-        pi = self.get_pi().unsqueeze(0)
-        kl_c = torch.sum(gamma * (torch.log(gamma + 1e-10) - torch.log(pi + 1e-10)), dim=1)
+        log_pi = F.log_softmax(self.pi_logits, dim=0).unsqueeze(0)
+        kl_c = torch.sum(gamma * (torch.log(gamma + 1e-10) - log_pi), dim=1)
 
         # Tổng hợp VaDE Loss
         loss = torch.sum(gamma * kl_z, dim=1) + kl_c

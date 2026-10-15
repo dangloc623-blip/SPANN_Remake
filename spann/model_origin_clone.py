@@ -429,28 +429,30 @@ class CrossEntropyLabelSmooth(nn.Module):
         return loss
 
 
-def sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=1e-4, max_iter=100):
+def sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=1e-4, max_iter=60):
     """
     Pure PyTorch GPU implementation of Unbalanced Sinkhorn-Knopp.
     Avoids CPU <-> GPU roundtrip and numpy conversions.
     """
     device = M.device
     M_d = M.double()
+    M_d = torch.clamp(M_d, min=-10.0, max=10.0)
     K = torch.exp(-M_d / reg)
     fi = reg_m / (reg_m + reg)
-    a = torch.as_tensor(alpha, device=device, dtype=torch.float64)
-    b = torch.as_tensor(beta, device=device, dtype=torch.float64)
+    a = alpha if isinstance(alpha, torch.Tensor) else torch.as_tensor(alpha, device=device, dtype=torch.float64)
+    b = beta if isinstance(beta, torch.Tensor) else torch.as_tensor(beta, device=device, dtype=torch.float64)
     u = torch.ones_like(a) / a.size(0)
     v = torch.ones_like(b) / b.size(0)
 
-    for _ in range(max_iter):
+    for it in range(max_iter):
         u_prev = u
         Kv = torch.matmul(K, v) + 1e-16
         u = (a / Kv) ** fi
         Ktu = torch.matmul(K.t(), u) + 1e-16
         v = (b / Ktu) ** fi
-        if torch.max(torch.abs(u - u_prev)) < stopThr:
-            break
+        if it % 5 == 0 and it > 0:
+            if torch.max(torch.abs(u - u_prev)) < stopThr:
+                break
 
     Q = u.unsqueeze(1) * K * v.unsqueeze(0)
     return Q.float()
@@ -467,13 +469,13 @@ def ubot_CCD(sim, beta, device, stopThr=1e-4, use_gpu=True):
     if use_gpu and sim.is_cuda:
         try:
             M = -sim
-            alpha = torch.ones(sim.size(0), device=device) / sim.size(0)
+            alpha = torch.ones(sim.size(0), device=device, dtype=torch.float64) / sim.size(0)
             Q_st = sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=stopThr)
             if not torch.isnan(Q_st).any() and not torch.isinf(Q_st).any():
                 sum_pi = torch.sum(Q_st)
                 Q_st_bar = Q_st / (sum_pi + 1e-12)
                 wt_i, pseudo_label = torch.max(Q_st_bar, 1)
-                new_beta = torch.sum(Q_st_bar, 0).detach().cpu().numpy()
+                new_beta = torch.sum(Q_st_bar, 0).detach()
                 return pseudo_label, new_beta, Q_st_bar, wt_i
         except Exception:
             pass
@@ -481,18 +483,19 @@ def ubot_CCD(sim, beta, device, stopThr=1e-4, use_gpu=True):
     # CPU POT fallback
     M = -sim
     alpha = ot.unif(sim.size(0))
+    beta_np = beta.cpu().numpy() if isinstance(beta, torch.Tensor) else beta
     Q_st = ot.unbalanced.sinkhorn_knopp_unbalanced(
-        alpha, beta, M.detach().cpu().numpy(), reg=0.01, reg_m=0.5, stopThr=stopThr
+        alpha, beta_np, M.detach().cpu().numpy(), reg=0.01, reg_m=0.5, stopThr=stopThr
     )
     Q_st = torch.from_numpy(Q_st).float().to(device)
 
     # make sum equals to 1
     sum_pi = torch.sum(Q_st)
-    Q_st_bar = Q_st / sum_pi
+    Q_st_bar = Q_st / (sum_pi + 1e-12)
     # confidence score w^t_i
     wt_i, pseudo_label = torch.max(Q_st_bar, 1)
 
-    new_beta = torch.sum(Q_st_bar, 0).cpu().numpy()
+    new_beta = torch.sum(Q_st_bar, 0).detach()
 
     return pseudo_label, new_beta, Q_st_bar, wt_i
 
@@ -616,12 +619,14 @@ class SPANN_model:
         except Exception:
             target_sp_gpu = None
 
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
         scaler = torch.cuda.amp.GradScaler() if (use_amp and self.device.type == "cuda") else None
         recon_crit = nn.BCELoss()
         cls_criterion = CrossEntropyLabelSmooth(self.class_num, device=self.device, epsilon=0.1).to(self.device)
 
         beta = None
-        beta_s = ot.unif(self.class_num)
+        beta_s = torch.ones(self.class_num, dtype=torch.float64, device=self.device) / self.class_num if self.device.type == "cuda" else ot.unif(self.class_num)
         threshold = None
         iteration = 0
 
@@ -656,10 +661,10 @@ class SPANN_model:
                     z_source, mu_source, var_source = self.encoder(im_source, 0, y_source)
                     z_target, mu_target, var_target = self.encoder(im_target, 0, y_target)
 
-                    recon_source_c = self.decoder.dec[0](z_source, y_source)
-                    recon_target_c = self.decoder.dec[0](z_target, y_target)
-                    recon_source_s = self.decoder.dec[2](z_source, y_source)
-                    recon_target_s = self.decoder.dec[1](z_target, y_target)
+                    recon_source_c = self.decoder.dec[0](z_source, y_source).clamp(1e-7, 1.0 - 1e-7)
+                    recon_target_c = self.decoder.dec[0](z_target, y_target).clamp(1e-7, 1.0 - 1e-7)
+                    recon_source_s = self.decoder.dec[2](z_source, y_source).clamp(1e-7, 1.0 - 1e-7)
+                    recon_target_s = self.decoder.dec[1](z_target, y_target).clamp(1e-7, 1.0 - 1e-7)
 
                     before_lincls_feat_s, after_lincls_s = self.classifier(z_source)
                     before_lincls_feat_t, after_lincls_t = self.classifier(z_target)
@@ -681,11 +686,12 @@ class SPANN_model:
                     cls_loss = cls_criterion(after_lincls_s, label_source)
                     spa_loss = torch.tensor(0.0, device=self.device)
                     ccd_loss = torch.tensor(0.0, device=self.device)
+                    neighbor_loss = torch.tensor(0.0, device=self.device)
 
                 if iteration > miditer1:
                     source_prototype = self.classifier.ProtoCLS.fc.weight
                     if beta is None:
-                        beta = ot.unif(source_prototype.size()[0])
+                        beta = torch.ones(source_prototype.size(0), dtype=torch.float64, device=self.device) / source_prototype.size(0)
                     sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
                     _, _, Qt_all, wti_all = ubot_CCD(sim_tar_all, beta, device=self.device)
                     confidence_ot_all = (wti_all - torch.min(wti_all)) / (torch.max(wti_all) - torch.min(wti_all) + 1e-12)
@@ -734,7 +740,7 @@ class SPANN_model:
 
                     # cell type ot alignment
                     if beta is None:
-                        beta = ot.unif(source_prototype.size()[0])
+                        beta = torch.ones(source_prototype.size(0), dtype=torch.float64, device=self.device) / source_prototype.size(0)
                     sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
 
                     # UOT-based CCD
@@ -743,8 +749,12 @@ class SPANN_model:
                         (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
                     )
                     weight_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-12)
-                    if True not in np.isnan(new_beta):
-                        beta = mu * beta + (1 - mu) * new_beta
+                    if isinstance(new_beta, torch.Tensor):
+                        if not torch.isnan(new_beta).any():
+                            beta = mu * beta + (1.0 - mu) * new_beta
+                    else:
+                        if True not in np.isnan(new_beta):
+                            beta = mu * beta + (1.0 - mu) * new_beta
                     pred_label_t = torch.argmax(after_lincls_t, axis=1)
                     pred_label_t_soft = torch.softmax(after_lincls_t, axis=1)
 
@@ -759,7 +769,6 @@ class SPANN_model:
                     # neighbor loss
                     local_loss = torch.tensor(0.0, device=self.device)
                     spatial_loss = torch.tensor(0.0, device=self.device)
-                    neighbor_loss = torch.tensor(0.0, device=self.device)
                     if iteration > miditer2 and high_conf_idx.sum() > 1:
                         dist_mat = pdists(batch_coor[high_conf_idx])
                         dist_mat += torch.max(dist_mat) * torch.eye(dist_mat.shape[0], device=self.device)
@@ -782,15 +791,15 @@ class SPANN_model:
 
                         neighbor_loss = (spatial_loss + local_loss) / 2
 
-                    # =====Total Loss=====
-                    loss = (
-                        lambda_recon * recon_loss
-                        + lambda_kl * kl_loss
-                        + cls_loss
-                        + lambda_cd * ccd_loss
-                        + lambda_nb * neighbor_loss
-                        + lambda_spa * spa_loss
-                    )
+                # =====Total Loss=====
+                loss = (
+                    lambda_recon * recon_loss
+                    + lambda_kl * kl_loss
+                    + cls_loss
+                    + lambda_cd * ccd_loss
+                    + lambda_nb * neighbor_loss
+                    + lambda_spa * spa_loss
+                )
 
                 optim_enc.zero_grad(set_to_none=True)
                 optim_dec.zero_grad(set_to_none=True)
@@ -887,18 +896,19 @@ class SPANN_model:
                             )
 
                             if threshold_test == None:
-                                ubot_feature_t_mix = mixup_target(z_target, device=self.device).to(self.device)
+                                idx_rand = torch.randperm(len(z_target))[:35]
+                                ubot_feature_t_mix = mixup_target(z_target[idx_rand], device=self.device).to(self.device)
                                 before_lincls_feat_t_mix, logit_t_mix = self.classifier(ubot_feature_t_mix)
                                 norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                                 sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
                                 _, _, _, wt_i_mix = ubot_CCD(sim_tar_mix, beta_s, device=self.device)
                                 confidence_ot_mix = (wt_i_mix - torch.min(wt_i_mix)) / (
-                                    torch.max(wt_i_mix) - torch.min(wt_i_mix)
+                                    torch.max(wt_i_mix) - torch.min(wt_i_mix) + 1e-12
                                 )
                                 Escore_mix_t, _, _, _ = ensemble_score(logit_t_mix, confidence_ot_mix)
                                 threshold_test = torch.mean(Escore_mix_t)
                                 threshold_test = torch.min(
-                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
+                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))], device=self.device)
                                 )
 
                             pred_known_id = torch.nonzero(Escore_t >= threshold_test).view(-1)
@@ -922,10 +932,11 @@ class SPANN_model:
                             confidence_ot_bank[idx_target] = confidence_ot_t.cpu().detach().numpy()
 
                         if iteration == miditer1 and novel_cell_test:
-                            dip_test = dip(Escore_bank, num_bins=100)
+                            sample_dip = Escore_bank if len(Escore_bank) <= 2000 else np.random.choice(Escore_bank, 2000, replace=False)
+                            dip_test = dip(sample_dip, num_bins=100)
                             dip_p_value = dip_test[-1]
                             dip_test = dip_test[-2]
-                            ensemble_total_scale = np.sqrt(Escore_bank)
+                            ensemble_total_scale = np.sqrt(sample_dip)
                             BC = calculate_bimodality_coefficient(ensemble_total_scale)
                             print("bimodality of dip test:", dip_p_value, not dip_test)
                             print("bimodality coefficient:(>0.555 indicates bimodality)", BC, BC > 0.555)
@@ -1012,12 +1023,14 @@ class SPANN_model:
         except Exception:
             target_sp_gpu = None
 
+        if self.device.type == "cuda":
+            torch.backends.cudnn.benchmark = True
         scaler = torch.cuda.amp.GradScaler() if (use_amp and self.device.type == "cuda") else None
         recon_crit = nn.BCELoss()
         cls_criterion = CrossEntropyLabelSmooth(self.class_num, device=self.device, epsilon=0.1).to(self.device)
 
         beta = None
-        beta_s = ot.unif(self.class_num)
+        beta_s = torch.ones(self.class_num, dtype=torch.float64, device=self.device) / self.class_num if self.device.type == "cuda" else ot.unif(self.class_num)
         threshold = None
         iteration = 0
 
@@ -1052,10 +1065,10 @@ class SPANN_model:
                     z_source, mu_source, var_source = self.encoder(im_source, 0, y_source)
                     z_target, mu_target, var_target = self.encoder(im_target, 0, y_target)
 
-                    recon_source_c = self.decoder.dec[0](z_source, y_source)
-                    recon_target_c = self.decoder.dec[0](z_target, y_target)
-                    recon_source_s = self.decoder.dec[2](z_source, y_source)
-                    recon_target_s = self.decoder.dec[1](z_target, y_target)
+                    recon_source_c = self.decoder.dec[0](z_source, y_source).clamp(1e-7, 1.0 - 1e-7)
+                    recon_target_c = self.decoder.dec[0](z_target, y_target).clamp(1e-7, 1.0 - 1e-7)
+                    recon_source_s = self.decoder.dec[2](z_source, y_source).clamp(1e-7, 1.0 - 1e-7)
+                    recon_target_s = self.decoder.dec[1](z_target, y_target).clamp(1e-7, 1.0 - 1e-7)
 
                     before_lincls_feat_s, after_lincls_s = self.classifier(z_source)
                     before_lincls_feat_t, after_lincls_t = self.classifier(z_target)
@@ -1077,11 +1090,12 @@ class SPANN_model:
                     cls_loss = cls_criterion(after_lincls_s, label_source)
                     spa_loss = torch.tensor(0.0, device=self.device)
                     ccd_loss = torch.tensor(0.0, device=self.device)
+                    neighbor_loss = torch.tensor(0.0, device=self.device)
 
                 if iteration > miditer1:
                     source_prototype = self.classifier.ProtoCLS.fc.weight
                     if beta is None:
-                        beta = ot.unif(source_prototype.size()[0])
+                        beta = torch.ones(source_prototype.size(0), dtype=torch.float64, device=self.device) / source_prototype.size(0)
                     sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
                     _, _, Qt_all, wti_all = ubot_CCD(sim_tar_all, beta, device=self.device)
                     confidence_ot_all = (wti_all - torch.min(wti_all)) / (torch.max(wti_all) - torch.min(wti_all) + 1e-12)
@@ -1130,7 +1144,7 @@ class SPANN_model:
 
                     # cell type ot alignment
                     if beta is None:
-                        beta = ot.unif(source_prototype.size()[0])
+                        beta = torch.ones(source_prototype.size(0), dtype=torch.float64, device=self.device) / source_prototype.size(0)
                     sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
 
                     # UOT-based CCD
@@ -1139,8 +1153,12 @@ class SPANN_model:
                         (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
                     )
                     weight_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-12)
-                    if True not in np.isnan(new_beta):
-                        beta = mu * beta + (1 - mu) * new_beta
+                    if isinstance(new_beta, torch.Tensor):
+                        if not torch.isnan(new_beta).any():
+                            beta = mu * beta + (1.0 - mu) * new_beta
+                    else:
+                        if True not in np.isnan(new_beta):
+                            beta = mu * beta + (1.0 - mu) * new_beta
                     pred_label_t = torch.argmax(after_lincls_t, axis=1)
                     pred_label_t_soft = torch.softmax(after_lincls_t, axis=1)
 
@@ -1155,7 +1173,6 @@ class SPANN_model:
                     # neighbor loss
                     local_loss = torch.tensor(0.0, device=self.device)
                     spatial_loss = torch.tensor(0.0, device=self.device)
-                    neighbor_loss = torch.tensor(0.0, device=self.device)
                     if iteration > miditer2 and high_conf_idx.sum() > 1:
                         dist_mat = pdists(batch_coor[high_conf_idx])
                         dist_mat += torch.max(dist_mat) * torch.eye(dist_mat.shape[0], device=self.device)
@@ -1178,15 +1195,15 @@ class SPANN_model:
 
                         neighbor_loss = (spatial_loss + local_loss) / 2
 
-                    # =====Total Loss=====
-                    loss = (
-                        lambda_recon * recon_loss
-                        + lambda_kl * kl_loss
-                        + cls_loss
-                        + lambda_cd * ccd_loss
-                        + lambda_nb * neighbor_loss
-                        + lambda_spa * spa_loss
-                    )
+                # =====Total Loss=====
+                loss = (
+                    lambda_recon * recon_loss
+                    + lambda_kl * kl_loss
+                    + cls_loss
+                    + lambda_cd * ccd_loss
+                    + lambda_nb * neighbor_loss
+                    + lambda_spa * spa_loss
+                )
 
                 optim_enc.zero_grad(set_to_none=True)
                 optim_dec.zero_grad(set_to_none=True)
@@ -1268,12 +1285,10 @@ class SPANN_model:
                             source_corrcnts_ot += torch.sum(pseudo_label_s_ot == label_source)
                             source_corrcnts_cls += torch.sum(pseudo_label_s_cls == label_source)
                             source_cnts += len(label_source)
+                        known_set = set(np.unique(source_labels))
                         for _, ((im_target, label_target, id_target)) in enumerate(test_target_cm_dl):
-                            index_tf_known = [
-                                label_target[i] in list(np.unique(source_labels)) for i in range(len(label_target))
-                            ]
-                            index_known = [i for i in range(len(index_tf_known)) if index_tf_known[i]]
-                            index_unknown = [i for i in range(len(index_tf_known)) if not index_tf_known[i]]
+                            index_known = [i for i, lbl in enumerate(label_target) if lbl.item() in known_set]
+                            index_unknown = [i for i, lbl in enumerate(label_target) if lbl.item() not in known_set]
 
                             im_target = im_target.to(self.device, non_blocking=True)
                             id_target = id_target.to(self.device, non_blocking=True)
@@ -1293,25 +1308,26 @@ class SPANN_model:
                             norm_feat_t = F.normalize(before_lincls_feat_t)
                             sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
                             _, _, _, wt_i = ubot_CCD(sim_tar_all, beta, device=self.device)
-                            confidence_ot_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i))
+                            confidence_ot_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-12)
 
                             Escore_t, entropy_cls_t, softmax_cls_t, confidence_ot_t = ensemble_score(
                                 after_lincls_t, confidence_ot_t
                             )
 
                             if threshold_test == None:
-                                ubot_feature_t_mix = mixup_target(z_target, device=self.device).to(self.device)
+                                idx_rand = torch.randperm(len(z_target))[:35]
+                                ubot_feature_t_mix = mixup_target(z_target[idx_rand], device=self.device).to(self.device)
                                 before_lincls_feat_t_mix, logit_t_mix = self.classifier(ubot_feature_t_mix)
                                 norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                                 sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
                                 _, _, _, wt_i_mix = ubot_CCD(sim_tar_mix, beta_s, device=self.device)
                                 confidence_ot_mix = (wt_i_mix - torch.min(wt_i_mix)) / (
-                                    torch.max(wt_i_mix) - torch.min(wt_i_mix)
+                                    torch.max(wt_i_mix) - torch.min(wt_i_mix) + 1e-12
                                 )
                                 Escore_mix_t, _, _, _ = ensemble_score(logit_t_mix, confidence_ot_mix)
                                 threshold_test = torch.mean(Escore_mix_t)
                                 threshold_test = torch.min(
-                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
+                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))], device=self.device)
                                 )
 
                             pred_known_id = torch.nonzero(Escore_t >= threshold_test).view(-1)
@@ -1337,10 +1353,11 @@ class SPANN_model:
                             target_unknown_cnts += len(index_unknown)
 
                         if iteration == miditer1 and novel_cell_test:
-                            dip_test = dip(Escore_bank, num_bins=100)
+                            sample_dip = Escore_bank if len(Escore_bank) <= 2000 else np.random.choice(Escore_bank, 2000, replace=False)
+                            dip_test = dip(sample_dip, num_bins=100)
                             dip_p_value = dip_test[-1]
                             dip_test = dip_test[-2]
-                            ensemble_total_scale = np.sqrt(Escore_bank)
+                            ensemble_total_scale = np.sqrt(sample_dip)
                             BC = calculate_bimodality_coefficient(ensemble_total_scale)
                             print("bimodality of dip test:", dip_p_value, not dip_test)
                             print("bimodality coefficient:(>0.45 indicates bimodality)", BC, BC > 0.45)
