@@ -429,46 +429,59 @@ class CrossEntropyLabelSmooth(nn.Module):
         return loss
 
 
-def sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=1e-3, max_iter=40):
+def sinkhorn_knopp_unbalanced_torch(
+    alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=1e-3, max_iter=40, log_v_init=None, check_every=5
+):
     """
-    Pure PyTorch GPU implementation of Unbalanced Sinkhorn-Knopp.
-    Avoids CPU <-> GPU roundtrip and numpy conversions.
+    Log-domain unbalanced Sinkhorn-Knopp on GPU (float32, no autograd).
+    - log-domain: stable with small reg, so no float64 needed (float64 is very slow on consumer GPUs)
+    - warm start: `log_v_init` (size = #classes) reuses the scaling vector of the previous call
+    - convergence is checked every `check_every` iterations to avoid GPU<->CPU syncs
+    :return: transport plan Q (float32), final log_v (for warm start)
     """
-    device = M.device
-    M_d = M.double()
-    K = torch.exp(-M_d / reg)
-    fi = reg_m / (reg_m + reg)
-    a = torch.as_tensor(alpha, device=device, dtype=torch.float64)
-    b = torch.as_tensor(beta, device=device, dtype=torch.float64)
-    u = torch.ones_like(a) / a.size(0)
-    v = torch.ones_like(b) / b.size(0)
+    with torch.no_grad():
+        device = M.device
+        logK = (-M.detach().float()) / reg  # log of the Gibbs kernel
+        fi = reg_m / (reg_m + reg)
+        log_a = torch.log(torch.as_tensor(alpha, device=device, dtype=torch.float32) + 1e-16)
+        log_b = torch.log(torch.as_tensor(beta, device=device, dtype=torch.float32) + 1e-16)
+        log_u = torch.full_like(log_a, -math.log(log_a.numel()))
+        if log_v_init is not None and log_v_init.shape == log_b.shape:
+            log_v = log_v_init.to(device)
+        else:
+            log_v = torch.full_like(log_b, -math.log(log_b.numel()))
 
-    for _ in range(max_iter):
-        u_prev = u
-        Kv = torch.matmul(K, v) + 1e-16
-        u = (a / Kv) ** fi
-        Ktu = torch.matmul(K.t(), u) + 1e-16
-        v = (b / Ktu) ** fi
-        if torch.max(torch.abs(u - u_prev)) < stopThr:
-            break
+        for it in range(max_iter):
+            log_u_prev = log_u
+            log_u = fi * (log_a - torch.logsumexp(logK + log_v.unsqueeze(0), dim=1))
+            log_v = fi * (log_b - torch.logsumexp(logK + log_u.unsqueeze(1), dim=0))
+            if (it + 1) % check_every == 0:
+                if torch.max(torch.abs(log_u - log_u_prev)) < stopThr:
+                    break
 
-    Q = u.unsqueeze(1) * K * v.unsqueeze(0)
-    return Q.float()
+        Q = torch.exp(log_u.unsqueeze(1) + logK + log_v.unsqueeze(0))
+    return Q, log_v
 
 
 # optimal transport alignment
-def ubot_CCD(sim, beta, device, stopThr=1e-3, max_iter=40, use_gpu=True):
+def ubot_CCD(sim, beta, device, stopThr=1e-3, max_iter=40, use_gpu=True, state=None, key=None):
     """
     Unbalanced optimal transport function with GPU acceleration
     :sim: similarity matrix between two distributions
     :beta: marginal distribution of the transport object
+    :state/key: optional dict + key to warm-start Sinkhorn from the previous call at the same call-site
     :return: pseudo label computed from the tranport plan, updated marginal distribution of the transport object, normarlized transport plan, confidence score of the transport plan
     """
     if use_gpu and sim.is_cuda:
         try:
             M = -sim
             alpha = torch.ones(sim.size(0), device=device) / sim.size(0)
-            Q_st = sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=stopThr, max_iter=max_iter)
+            log_v_init = state.get(key) if (state is not None and key is not None) else None
+            Q_st, log_v = sinkhorn_knopp_unbalanced_torch(
+                alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=stopThr, max_iter=max_iter, log_v_init=log_v_init
+            )
+            if state is not None and key is not None and torch.isfinite(log_v).all():
+                state[key] = log_v
             if not torch.isnan(Q_st).any() and not torch.isinf(Q_st).any():
                 sum_pi = torch.sum(Q_st)
                 Q_st_bar = Q_st / (sum_pi + 1e-12)
@@ -771,7 +784,7 @@ class SPANN_model:
         miditer2=5000,
         miditer3=4000,
         test_freq=1000,
-        threshold_freq=100,
+        threshold_freq=200,
         mixup_samples=35,
         sinkhorn_max_iter=40,
         sinkhorn_stop_thr=1e-3,
@@ -833,6 +846,7 @@ class SPANN_model:
         beta_s = ot.unif(self.class_num)
         threshold = None
         iteration = 0
+        ot_state = {}  # warm-start cache for Sinkhorn scaling vectors
 
         while iteration < maxiter:
             if len(source_sp_ds) > len(target_sp_ds):
@@ -897,7 +911,7 @@ class SPANN_model:
                         beta = ot.unif(source_prototype.size()[0])
                     sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
                     _, _, Qt_all, wti_all = ubot_CCD(
-                        sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                        sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter, state=ot_state, key="all"
                     )
                     confidence_ot_all = (wti_all - torch.min(wti_all)) / (torch.max(wti_all) - torch.min(wti_all) + 1e-12)
                     Escore_t, _, _, _ = ensemble_score(after_lincls_t, confidence_ot_all)
@@ -911,7 +925,7 @@ class SPANN_model:
                             norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                             sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
                             _, _, _, wti_mix = ubot_CCD(
-                                sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                                sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter, state=ot_state, key="mix"
                             )
                             confidence_ot_mix = (wti_mix - torch.min(wti_mix)) / (
                                 torch.max(wti_mix) - torch.min(wti_mix) + 1e-12
@@ -952,7 +966,7 @@ class SPANN_model:
 
                     # UOT-based CCD
                     pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(
-                        sim, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                        sim, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter, state=ot_state, key="hc"
                     )
                     pseudo_label_t_soft_high_conf = Q_t * (
                         (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
@@ -1192,7 +1206,7 @@ class SPANN_model:
         miditer2=5000,
         miditer3=4000,
         test_freq=1000,
-        threshold_freq=100,
+        threshold_freq=200,
         mixup_samples=35,
         sinkhorn_max_iter=40,
         sinkhorn_stop_thr=1e-3,
@@ -1254,6 +1268,7 @@ class SPANN_model:
         beta_s = ot.unif(self.class_num)
         threshold = None
         iteration = 0
+        ot_state = {}  # warm-start cache for Sinkhorn scaling vectors
 
         while iteration < maxiter:
             if len(source_sp_ds) > len(target_sp_ds):
@@ -1318,7 +1333,7 @@ class SPANN_model:
                         beta = ot.unif(source_prototype.size()[0])
                     sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
                     _, _, Qt_all, wti_all = ubot_CCD(
-                        sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                        sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter, state=ot_state, key="all"
                     )
                     confidence_ot_all = (wti_all - torch.min(wti_all)) / (torch.max(wti_all) - torch.min(wti_all) + 1e-12)
                     Escore_t, _, _, _ = ensemble_score(after_lincls_t, confidence_ot_all)
@@ -1332,7 +1347,7 @@ class SPANN_model:
                             norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                             sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
                             _, _, _, wti_mix = ubot_CCD(
-                                sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                                sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter, state=ot_state, key="mix"
                             )
                             confidence_ot_mix = (wti_mix - torch.min(wti_mix)) / (
                                 torch.max(wti_mix) - torch.min(wti_mix) + 1e-12
@@ -1373,7 +1388,7 @@ class SPANN_model:
 
                     # UOT-based CCD
                     pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(
-                        sim, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                        sim, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter, state=ot_state, key="hc"
                     )
                     pseudo_label_t_soft_high_conf = Q_t * (
                         (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
