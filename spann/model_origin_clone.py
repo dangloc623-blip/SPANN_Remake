@@ -16,7 +16,14 @@ from torch.autograd import Function
 from torch.distributions import Beta, Normal, kl_divergence
 from torch.nn import init
 from torch.nn.parameter import Parameter
-from vade_prior import VaDEPrior
+
+try:
+    from .vade_prior import VaDEPrior
+    from .preprocess import generate_ae_params, generate_dataloaders
+except (ImportError, ValueError):
+    from vade_prior import VaDEPrior
+    from preprocess import generate_ae_params, generate_dataloaders
+
 
 def kl_div(mu, var, weight=None):
     # calculate kl divergence
@@ -33,24 +40,18 @@ def kl_div(mu, var, weight=None):
 
 
 def distance_matrix(pts_src: torch.Tensor, pts_dst: torch.Tensor, p: int = 2):
-    # Returns the matrix of ||x_i-y_j||_p^p.
-
-    x_col = pts_src.unsqueeze(1)
-    y_row = pts_dst.unsqueeze(0)
-    distance = torch.sum((torch.abs(x_col - y_row)) ** p, 2)
-    return distance
+    # Returns the matrix of ||x_i-y_j||_p^p via optimized PyTorch CUDA kernel
+    if p == 2:
+        return torch.cdist(pts_src, pts_dst, p=2.0) ** 2
+    return torch.cdist(pts_src, pts_dst, p=float(p)) ** p
 
 
 def distance_gmm(mu_src: torch.Tensor, mu_dst: torch.Tensor, var_src: torch.Tensor, var_dst: torch.Tensor):
     # Calculate a Wasserstein distance matrix between the gmm distributions with diagonal variances
-
     std_src = var_src.sqrt()
     std_dst = var_dst.sqrt()
-    distance_mean = distance_matrix(mu_src, mu_dst, p=2)
-    distance_var = distance_matrix(std_src, std_dst, p=2)
-
-    # distance_var = torch.sum(sum_matrix(std_src, std_dst) - 2 * (prod_matrix(std_src, std_dst) ** 0.5), 2)
-
+    distance_mean = torch.cdist(mu_src, mu_dst, p=2.0) ** 2
+    distance_var = torch.cdist(std_src, std_dst, p=2.0) ** 2
     return distance_mean + distance_var
 
 
@@ -382,7 +383,7 @@ class CLS(nn.Module):
     a classifier made up of projection head and prototype-based classifier
     """
 
-    def __init__(self, in_dim, out_dim, hidden_mlp=1024, feat_dim=16, temp=0.05):
+    def __init__(self, in_dim, out_dim, hidden_mlp=512, feat_dim=16, temp=0.05):
         super(CLS, self).__init__()
         self.projection_head = nn.Sequential(
             nn.Linear(in_dim, hidden_mlp), nn.ReLU(inplace=True), nn.Linear(hidden_mlp, feat_dim)
@@ -417,9 +418,8 @@ class CrossEntropyLabelSmooth(nn.Module):
         :targets: ground truth labels with shape (num_classes)
         """
         log_probs = self.logsoftmax(inputs)
-        targets = torch.zeros(log_probs.size()).scatter_(1, targets.unsqueeze(1).cpu(), 1)  #
+        targets = torch.zeros(log_probs.size(), device=self.device).scatter_(1, targets.unsqueeze(1), 1)
 
-        targets = targets.to(self.device)
         targets = (1 - self.epsilon) * targets + self.epsilon / self.num_classes
         loss = (-targets * log_probs).sum(dim=1)  # 对行求和，消掉列，keepdim=True则列变成1
         if self.reduction:
@@ -429,7 +429,7 @@ class CrossEntropyLabelSmooth(nn.Module):
         return loss
 
 
-def sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=1e-4, max_iter=100):
+def sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=1e-3, max_iter=40):
     """
     Pure PyTorch GPU implementation of Unbalanced Sinkhorn-Knopp.
     Avoids CPU <-> GPU roundtrip and numpy conversions.
@@ -457,7 +457,7 @@ def sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr
 
 
 # optimal transport alignment
-def ubot_CCD(sim, beta, device, stopThr=1e-4, use_gpu=True):
+def ubot_CCD(sim, beta, device, stopThr=1e-3, max_iter=40, use_gpu=True):
     """
     Unbalanced optimal transport function with GPU acceleration
     :sim: similarity matrix between two distributions
@@ -468,7 +468,7 @@ def ubot_CCD(sim, beta, device, stopThr=1e-4, use_gpu=True):
         try:
             M = -sim
             alpha = torch.ones(sim.size(0), device=device) / sim.size(0)
-            Q_st = sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=stopThr)
+            Q_st = sinkhorn_knopp_unbalanced_torch(alpha, beta, M, reg=0.01, reg_m=0.5, stopThr=stopThr, max_iter=max_iter)
             if not torch.isnan(Q_st).any() and not torch.isinf(Q_st).any():
                 sum_pi = torch.sum(Q_st)
                 Q_st_bar = Q_st / (sum_pi + 1e-12)
@@ -482,7 +482,7 @@ def ubot_CCD(sim, beta, device, stopThr=1e-4, use_gpu=True):
     M = -sim
     alpha = ot.unif(sim.size(0))
     Q_st = ot.unbalanced.sinkhorn_knopp_unbalanced(
-        alpha, beta, M.detach().cpu().numpy(), reg=0.01, reg_m=0.5, stopThr=stopThr
+        alpha, beta, M.detach().cpu().numpy(), reg=0.01, reg_m=0.5, stopThr=stopThr, numItermax=max_iter
     )
     Q_st = torch.from_numpy(Q_st).float().to(device)
 
@@ -509,13 +509,13 @@ def ensemble_score(logit_tensor, confidence_ot):
 
 
 def mixup_target(x_batch, device):  ##batchsize*latent
-    m = Beta(torch.tensor([1.0]), torch.tensor([1.0]))
+    m = Beta(torch.tensor([1.0], device=device), torch.tensor([1.0], device=device))
     x_batch_expand = x_batch.unsqueeze(1)  ##batchsize * 1 * input_dim
-    weight = (m.sample([x_batch_expand.size()[0], x_batch_expand.size()[1]])).to(device)
-    x_batch_mix = weight * x_batch + (1 - weight) * x_batch_expand  ##   batchsize * batchsize * input_dim
-    x_batch_mix = x_batch_mix.view([-1, x_batch_mix.size()[-1]])  ## (batchsize * batchsize) * input_dim
-    index = torch.arange(0, x_batch_mix.size()[0])  # (batchsize * batchsize)
-    x_batch_mix = x_batch_mix[index % (x_batch.size()[0] + 1) != 0]  ##  (batchsize * (batchsize-1)) * input_dim
+    weight = m.sample([x_batch_expand.size(0), x_batch_expand.size(1)])
+    x_batch_mix = weight * x_batch + (1 - weight) * x_batch_expand  ## batchsize * batchsize * input_dim
+    x_batch_mix = x_batch_mix.view(-1, x_batch_mix.size(-1))  ## (batchsize * batchsize) * input_dim
+    index = torch.arange(0, x_batch_mix.size(0), device=device)  # (batchsize * batchsize)
+    x_batch_mix = x_batch_mix[index % (x_batch.size(0) + 1) != 0]  ## (batchsize * (batchsize-1)) * input_dim
     return x_batch_mix
 
 
@@ -533,39 +533,228 @@ def pdists(A, squared=False, eps=0):
 
 class SPANN_model:
     """
-    SPANN model, using scRNA reference dataset to annotate spatial transcriptome dataset
-
-    :x_dim: input dimension for the encoder
-    :z_dim: latent feature dimension
-    :enc: encoder parameters, for example, [['fc', 1024, 1, 'relu'], ['fc', 16, '', '']]
-    :dec: decoder parameters, dec is a set {cm_dec_params, spa_dec_params, rna_dec_params}, each element shapes like enc
-    :class_num: number of scRNA-seq cell types
-    :device: device on which SPAMM model is aranged
-
+    SPANN model, using scRNA reference dataset to annotate spatial transcriptome dataset.
+    Hỗ trợ 2 cách khởi tạo:
+    1. Cách siêu rút gọn (khuyên dùng):
+       spann = SPANN_model(adata_cm, adata_spa, adata_rna)
+       -> Tự động trích xuất enc, dec, x_dim, z_dim, class_num, device.
+    2. Cách cũ (legacy):
+       spann = SPANN_model(x_dim, z_dim, enc, dec, class_num, device)
     """
 
-    def __init__(self, x_dim, z_dim, enc, dec, class_num, device):
+    def __init__(
+        self,
+        *args,
+        adata_cm=None,
+        adata_spa=None,
+        adata_rna=None,
+        class_num=None,
+        device=None,
+        feat_dim=16,
+        hidden_dim=512,
+        cls_hidden=512,
+        x_dim=None,
+        z_dim=None,
+        enc=None,
+        dec=None,
+        **kwargs,
+    ):
         super().__init__()
+        is_legacy = False
+        if len(args) >= 4 and isinstance(args[0], dict):
+            is_legacy = True
+        elif x_dim is not None and z_dim is not None and enc is not None and dec is not None:
+            is_legacy = True
+
+        if is_legacy:
+            if len(args) >= 4:
+                x_dim, z_dim, enc, dec = args[0], args[1], args[2], args[3]
+                if len(args) > 4 and class_num is None:
+                    class_num = args[4]
+                if len(args) > 5 and device is None:
+                    device = args[5]
+        else:
+            if len(args) >= 3:
+                adata_cm, adata_spa, adata_rna = args[0], args[1], args[2]
+                if len(args) > 3 and class_num is None:
+                    class_num = args[3]
+                if len(args) > 4 and device is None:
+                    device = args[4]
+
+            if adata_cm is not None and adata_spa is not None and adata_rna is not None:
+                self.adata_cm = adata_cm
+                self.adata_spa = adata_spa
+                self.adata_rna = adata_rna
+
+                if enc is None or dec is None or x_dim is None or z_dim is None:
+                    enc, dec, x_dim, z_dim = generate_ae_params(
+                        adata_cm, adata_spa, adata_rna, feat_dim=feat_dim
+                    )
+                    if hidden_dim != 1024 and len(enc) > 1:
+                        enc[0][1] = hidden_dim
+
+                if class_num is None:
+                    if "cell_type" in adata_rna.obs:
+                        class_num = len(np.unique(adata_rna.obs["cell_type"]))
+                    elif "labels" in adata_rna.obs:
+                        u_lbls = np.unique(adata_rna.obs["labels"])
+                        class_num = len(u_lbls[u_lbls >= 0])
+                    else:
+                        raise ValueError("Không thể tự suy luận class_num, vui lòng truyền class_num!")
+
+        if device is None:
+            device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        elif isinstance(device, str):
+            device = torch.device(device)
+
+        if class_num is None or enc is None or dec is None or x_dim is None or z_dim is None:
+            raise ValueError(
+                "Không đủ thông tin để khởi tạo SPANN_model! "
+                "Hãy truyền (adata_cm, adata_spa, adata_rna) hoặc (x_dim, z_dim, enc, dec, class_num, device)."
+            )
+
         self.class_num = class_num
         self.device = device
         self.feat_dim = enc[-1][1]
         self.encoder = Encoder(x_dim, enc).to(device)
         self.decoder = Decoder(z_dim, dec).to(device)
-        self.classifier = CLS(z_dim, class_num).to(device)
-        
-        # [MỚI THÊM] Khởi tạo GMM Prior với số cụm = số class đã biết + 5 cụm dự phòng cho Novel Cells
+        self.classifier = CLS(z_dim, class_num, hidden_mlp=cls_hidden, feat_dim=self.feat_dim).to(device)
         self.gmm_prior = VaDEPrior(n_components=class_num + 5, latent_dim=z_dim).to(device)
+
+    def _resolve_train_inputs(self, args, kwargs, is_eval=False):
+        """
+        Tự động xử lý và trích xuất dữ liệu:
+        - Cách siêu rút gọn (mới): Không cần truyền tham số nào (nếu đã truyền adata khi khởi tạo)
+          hoặc chỉ cần truyền (adata_cm, adata_spa, adata_rna).
+        - Cách legacy (cũ): Truyền toàn bộ DataLoader / Dataset / Labels riêng lẻ.
+        """
+        is_legacy = False
+        if len(args) >= 5:
+            first_arg = args[0]
+            if not (hasattr(first_arg, "obs") and hasattr(first_arg, "X")):
+                is_legacy = True
+
+        if is_legacy:
+            source_cm_dl = args[0]
+            target_cm_dl = args[1]
+            source_sp_ds = args[2]
+            target_sp_ds = args[3]
+            spatial_coor = args[4]
+            test_source_cm_dl = args[5] if len(args) > 5 else kwargs.get("test_source_cm_dl", source_cm_dl)
+            test_target_cm_dl = args[6] if len(args) > 6 else kwargs.get("test_target_cm_dl", target_cm_dl)
+            source_labels = args[7] if len(args) > 7 else kwargs.get("source_labels")
+            if is_eval:
+                target_labels = args[8] if len(args) > 8 else kwargs.get("target_labels")
+                cell_types = args[9] if len(args) > 9 else kwargs.get("cell_types")
+                common_cell_type = args[10] if len(args) > 10 else kwargs.get("common_cell_type")
+                return (
+                    source_cm_dl, target_cm_dl, source_sp_ds, target_sp_ds, spatial_coor,
+                    test_source_cm_dl, test_target_cm_dl, source_labels, target_labels,
+                    cell_types, common_cell_type,
+                )
+            else:
+                cell_types = args[8] if len(args) > 8 else kwargs.get("cell_types")
+                return (
+                    source_cm_dl, target_cm_dl, source_sp_ds, target_sp_ds, spatial_coor,
+                    test_source_cm_dl, test_target_cm_dl, source_labels, cell_types,
+                )
+
+        adata_cm = kwargs.get("adata_cm", None)
+        adata_spa = kwargs.get("adata_spa", None)
+        adata_rna = kwargs.get("adata_rna", None)
+
+        if len(args) >= 3:
+            adata_cm, adata_spa, adata_rna = args[0], args[1], args[2]
+        elif len(args) == 2:
+            adata_cm, adata_spa = args[0], args[1]
+        elif len(args) == 1:
+            adata_cm = args[0]
+
+        if adata_cm is None:
+            adata_cm = getattr(self, "adata_cm", None)
+        if adata_spa is None:
+            adata_spa = getattr(self, "adata_spa", None)
+        if adata_rna is None:
+            adata_rna = getattr(self, "adata_rna", None)
+
+        if adata_cm is None or adata_spa is None or adata_rna is None:
+            raise ValueError(
+                "Thiếu dữ liệu! Vui lòng truyền adata_cm, adata_spa, adata_rna vào hàm khởi tạo SPANN_model "
+                "hoặc truyền trực tiếp vào spann.train(adata_cm, adata_spa, adata_rna)."
+            )
+
+        batch_size = kwargs.get("batch_size", 256)
+        num_workers = kwargs.get("num_workers", 0)
+
+        (
+            source_sp_ds,
+            target_sp_ds,
+            source_cm_dl,
+            target_cm_dl,
+            test_source_cm_dl,
+            test_target_cm_dl,
+        ) = generate_dataloaders(
+            adata_cm, adata_spa, adata_rna, batch_size=batch_size, num_workers=num_workers
+        )
+
+        if "spatial_coor" in kwargs:
+            spatial_coor = kwargs["spatial_coor"]
+        elif "spatial" in adata_spa.obsm:
+            spatial_coor = adata_spa.obsm["spatial"]
+        elif "X" in adata_spa.obs and "Y" in adata_spa.obs:
+            spatial_coor = adata_spa.obs[["X", "Y"]]
+        elif "x" in adata_spa.obs and "y" in adata_spa.obs:
+            spatial_coor = adata_spa.obs[["x", "y"]]
+        elif "spatial_x" in adata_spa.obs and "spatial_y" in adata_spa.obs:
+            spatial_coor = adata_spa.obs[["spatial_x", "spatial_y"]]
+        else:
+            raise ValueError("Không tìm thấy cột tọa độ ('X', 'Y' hoặc obsm['spatial']) trong adata_spa!")
+
+        if "source_labels" in kwargs:
+            source_labels = kwargs["source_labels"]
+        elif "labels" in adata_rna.obs:
+            source_labels = np.array(adata_rna.obs["labels"])
+        else:
+            raise ValueError("Không tìm thấy 'labels' trong adata_rna.obs! Vui lòng chạy anndata_preprocess trước.")
+
+        if "cell_types" in kwargs:
+            cell_types = kwargs["cell_types"]
+        elif "cell_type" in adata_rna.obs:
+            cell_types = np.unique(adata_rna.obs["cell_type"])
+        else:
+            cell_types = np.unique(source_labels)
+
+        if is_eval:
+            if "target_labels" in kwargs:
+                target_labels = kwargs["target_labels"]
+            elif "labels" in adata_spa.obs:
+                target_labels = np.array(adata_spa.obs["labels"])
+            else:
+                raise ValueError("Không tìm thấy 'labels' trong adata_spa.obs cho train_eval!")
+
+            if "common_cell_type" in kwargs:
+                common_cell_type = kwargs["common_cell_type"]
+            elif "cell_type" in adata_rna.obs and "cell_type" in adata_spa.obs:
+                common_cell_type = [
+                    c for c in np.unique(adata_rna.obs["cell_type"]) if c in np.unique(adata_spa.obs["cell_type"])
+                ]
+            else:
+                common_cell_type = cell_types
+
+            return (
+                source_cm_dl, target_cm_dl, source_sp_ds, target_sp_ds, spatial_coor,
+                test_source_cm_dl, test_target_cm_dl, source_labels, target_labels,
+                cell_types, common_cell_type,
+            )
+        else:
+            return (
+                source_cm_dl, target_cm_dl, source_sp_ds, target_sp_ds, spatial_coor,
+                test_source_cm_dl, test_target_cm_dl, source_labels, cell_types,
+            )
+
     def train(
         self,
-        source_cm_dl,
-        target_cm_dl,
-        source_sp_ds,
-        target_sp_ds,
-        spatial_coor,
-        test_source_cm_dl,
-        test_target_cm_dl,
-        source_labels,
-        cell_types,
+        *args,
         lr=2e-4,
         lambda_recon=2000,
         lambda_kl=0.5,
@@ -583,11 +772,31 @@ class SPANN_model:
         miditer3=4000,
         test_freq=1000,
         threshold_freq=100,
+        mixup_samples=35,
+        sinkhorn_max_iter=40,
+        sinkhorn_stop_thr=1e-3,
         use_amp=True,
+        **kwargs,
     ):
         """
-        Training and evaluating function for SPANN applying on test spatial dataset with ground truth labels
+        Training function for SPANN.
+        Hỗ trợ gọi siêu ngắn gọn:
+            spann.train()  # Nếu đã truyền adata lúc khởi tạo
+            spann.train(adata_cm, adata_spa, adata_rna)
+        Hoặc truyền 9 đối số legacy như cũ.
         """
+        (
+            source_cm_dl,
+            target_cm_dl,
+            source_sp_ds,
+            target_sp_ds,
+            spatial_coor,
+            test_source_cm_dl,
+            test_target_cm_dl,
+            source_labels,
+            cell_types,
+        ) = self._resolve_train_inputs(args, kwargs, is_eval=False)
+
         optim_enc = torch.optim.Adam(self.encoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_dec = torch.optim.Adam(self.decoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_cls = torch.optim.Adam(self.classifier.parameters(), lr=lr, weight_decay=5e-4)
@@ -687,19 +896,23 @@ class SPANN_model:
                     if beta is None:
                         beta = ot.unif(source_prototype.size()[0])
                     sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
-                    _, _, Qt_all, wti_all = ubot_CCD(sim_tar_all, beta, device=self.device)
+                    _, _, Qt_all, wti_all = ubot_CCD(
+                        sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                    )
                     confidence_ot_all = (wti_all - torch.min(wti_all)) / (torch.max(wti_all) - torch.min(wti_all) + 1e-12)
                     Escore_t, _, _, _ = ensemble_score(after_lincls_t, confidence_ot_all)
                     ###  calculate threshold
                     if threshold is None or iteration % threshold_freq == 0:
                         with torch.no_grad():
-                            idx_rand = torch.randperm(len(z_target))[:35]
-                            ubot_feature_t_mix = mixup_target(z_target[idx_rand], device=self.device).to(self.device)
+                            idx_rand = torch.randperm(len(z_target), device=self.device)[:mixup_samples]
+                            ubot_feature_t_mix = mixup_target(z_target[idx_rand], device=self.device)
 
                             before_lincls_feat_t_mix, logit_t_mix = self.classifier(ubot_feature_t_mix)
                             norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                             sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
-                            _, _, _, wti_mix = ubot_CCD(sim_tar_mix, beta_s, device=self.device)
+                            _, _, _, wti_mix = ubot_CCD(
+                                sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                            )
                             confidence_ot_mix = (wti_mix - torch.min(wti_mix)) / (
                                 torch.max(wti_mix) - torch.min(wti_mix) + 1e-12
                             )
@@ -738,7 +951,9 @@ class SPANN_model:
                     sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
 
                     # UOT-based CCD
-                    pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(sim, beta, device=self.device)
+                    pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(
+                        sim, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                    )
                     pseudo_label_t_soft_high_conf = Q_t * (
                         (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
                     )
@@ -859,7 +1074,9 @@ class SPANN_model:
                             pseudo_label_s_cls = torch.argmax(after_lincls_s, axis=1)
                             norm_feat_s = F.normalize(before_lincls_feat_s)
                             sim_src = torch.matmul(norm_feat_s, source_prototype.t())
-                            pseudo_label_s_ot, _, _, _ = ubot_CCD(sim_src, beta_s, device=self.device)
+                            pseudo_label_s_ot, _, _, _ = ubot_CCD(
+                                sim_src, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                            )
 
                         for _, ((im_target, label_target, id_target)) in enumerate(test_target_cm_dl):
                             im_target = im_target.to(self.device, non_blocking=True)
@@ -879,26 +1096,32 @@ class SPANN_model:
 
                             norm_feat_t = F.normalize(before_lincls_feat_t)
                             sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
-                            _, _, _, wt_i = ubot_CCD(sim_tar_all, beta, device=self.device)
-                            confidence_ot_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i))
+                            _, _, _, wt_i = ubot_CCD(
+                                sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                            )
+                            confidence_ot_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-12)
 
                             Escore_t, entropy_cls_t, softmax_cls_t, confidence_ot_t = ensemble_score(
                                 after_lincls_t, confidence_ot_t
                             )
 
                             if threshold_test == None:
-                                ubot_feature_t_mix = mixup_target(z_target, device=self.device).to(self.device)
+                                rand_n = min(mixup_samples, len(z_target))
+                                idx_rand_test = torch.randperm(len(z_target), device=self.device)[:rand_n]
+                                ubot_feature_t_mix = mixup_target(z_target[idx_rand_test], device=self.device)
                                 before_lincls_feat_t_mix, logit_t_mix = self.classifier(ubot_feature_t_mix)
                                 norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                                 sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
-                                _, _, _, wt_i_mix = ubot_CCD(sim_tar_mix, beta_s, device=self.device)
+                                _, _, _, wt_i_mix = ubot_CCD(
+                                    sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                                )
                                 confidence_ot_mix = (wt_i_mix - torch.min(wt_i_mix)) / (
-                                    torch.max(wt_i_mix) - torch.min(wt_i_mix)
+                                    torch.max(wt_i_mix) - torch.min(wt_i_mix) + 1e-12
                                 )
                                 Escore_mix_t, _, _, _ = ensemble_score(logit_t_mix, confidence_ot_mix)
                                 threshold_test = torch.mean(Escore_mix_t)
                                 threshold_test = torch.min(
-                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
+                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))], device=self.device)
                                 )
 
                             pred_known_id = torch.nonzero(Escore_t >= threshold_test).view(-1)
@@ -909,7 +1132,7 @@ class SPANN_model:
                             sim_tar_high_conf = torch.matmul(norm_feat_t[pred_known_id], source_prototype.t())
                             if sim_tar_high_conf.size()[0] > 0:
                                 pseudo_label_t_high_conf, _, _, _ = ubot_CCD(
-                                    sim_tar_high_conf, beta, device=self.device
+                                    sim_tar_high_conf, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
                                 )
                                 pseudo_label_t_ot[pred_known_id] = pseudo_label_t_high_conf
 
@@ -952,17 +1175,7 @@ class SPANN_model:
 
     def train_eval(
         self,
-        source_cm_dl,
-        target_cm_dl,
-        source_sp_ds,
-        target_sp_ds,
-        spatial_coor,
-        test_source_cm_dl,
-        test_target_cm_dl,
-        source_labels,
-        target_labels,
-        cell_types,
-        common_cell_type,
+        *args,
         lr=2e-4,
         lambda_recon=2000,
         lambda_kl=0.5,
@@ -980,11 +1193,32 @@ class SPANN_model:
         miditer3=4000,
         test_freq=1000,
         threshold_freq=100,
+        mixup_samples=35,
+        sinkhorn_max_iter=40,
+        sinkhorn_stop_thr=1e-3,
         use_amp=True,
+        **kwargs,
     ):
         """
-        Training and evaluating function for SPANN applying on test spatial dataset with ground truth labels
+        Training and evaluating function for SPANN.
+        Hỗ trợ gọi siêu ngắn gọn:
+            spann.train_eval()
+            spann.train_eval(adata_cm, adata_spa, adata_rna)
+        Hoặc truyền 11 đối số legacy như cũ.
         """
+        (
+            source_cm_dl,
+            target_cm_dl,
+            source_sp_ds,
+            target_sp_ds,
+            spatial_coor,
+            test_source_cm_dl,
+            test_target_cm_dl,
+            source_labels,
+            target_labels,
+            cell_types,
+            common_cell_type,
+        ) = self._resolve_train_inputs(args, kwargs, is_eval=True)
         optim_enc = torch.optim.Adam(self.encoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_dec = torch.optim.Adam(self.decoder.parameters(), lr=lr, weight_decay=5e-4)
         optim_cls = torch.optim.Adam(self.classifier.parameters(), lr=lr, weight_decay=5e-4)
@@ -1083,19 +1317,23 @@ class SPANN_model:
                     if beta is None:
                         beta = ot.unif(source_prototype.size()[0])
                     sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
-                    _, _, Qt_all, wti_all = ubot_CCD(sim_tar_all, beta, device=self.device)
+                    _, _, Qt_all, wti_all = ubot_CCD(
+                        sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                    )
                     confidence_ot_all = (wti_all - torch.min(wti_all)) / (torch.max(wti_all) - torch.min(wti_all) + 1e-12)
                     Escore_t, _, _, _ = ensemble_score(after_lincls_t, confidence_ot_all)
                     ###  calculate threshold
                     if threshold is None or iteration % threshold_freq == 0:
                         with torch.no_grad():
-                            idx_rand = torch.randperm(len(z_target))[:35]
-                            ubot_feature_t_mix = mixup_target(z_target[idx_rand], device=self.device).to(self.device)
+                            idx_rand = torch.randperm(len(z_target), device=self.device)[:mixup_samples]
+                            ubot_feature_t_mix = mixup_target(z_target[idx_rand], device=self.device)
 
                             before_lincls_feat_t_mix, logit_t_mix = self.classifier(ubot_feature_t_mix)
                             norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                             sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
-                            _, _, _, wti_mix = ubot_CCD(sim_tar_mix, beta_s, device=self.device)
+                            _, _, _, wti_mix = ubot_CCD(
+                                sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                            )
                             confidence_ot_mix = (wti_mix - torch.min(wti_mix)) / (
                                 torch.max(wti_mix) - torch.min(wti_mix) + 1e-12
                             )
@@ -1134,7 +1372,9 @@ class SPANN_model:
                     sim = torch.matmul(norm_feat_t[high_conf_idx], source_prototype.t())
 
                     # UOT-based CCD
-                    pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(sim, beta, device=self.device)
+                    pseudo_label_t_high_conf, new_beta, Q_t, wt_i = ubot_CCD(
+                        sim, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                    )
                     pseudo_label_t_soft_high_conf = Q_t * (
                         (1 / torch.sum(Q_t, 1)).unsqueeze(1).expand(-1, Q_t.size()[1])
                     )
@@ -1263,7 +1503,9 @@ class SPANN_model:
                             pseudo_label_s_cls = torch.argmax(after_lincls_s, axis=1)
                             norm_feat_s = F.normalize(before_lincls_feat_s)
                             sim_src = torch.matmul(norm_feat_s, source_prototype.t())
-                            pseudo_label_s_ot, _, _, _ = ubot_CCD(sim_src, beta_s, device=self.device)
+                            pseudo_label_s_ot, _, _, _ = ubot_CCD(
+                                sim_src, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                            )
 
                             source_corrcnts_ot += torch.sum(pseudo_label_s_ot == label_source)
                             source_corrcnts_cls += torch.sum(pseudo_label_s_cls == label_source)
@@ -1292,26 +1534,32 @@ class SPANN_model:
 
                             norm_feat_t = F.normalize(before_lincls_feat_t)
                             sim_tar_all = torch.matmul(norm_feat_t, source_prototype.t())
-                            _, _, _, wt_i = ubot_CCD(sim_tar_all, beta, device=self.device)
-                            confidence_ot_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i))
+                            _, _, _, wt_i = ubot_CCD(
+                                sim_tar_all, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                            )
+                            confidence_ot_t = (wt_i - torch.min(wt_i)) / (torch.max(wt_i) - torch.min(wt_i) + 1e-12)
 
                             Escore_t, entropy_cls_t, softmax_cls_t, confidence_ot_t = ensemble_score(
                                 after_lincls_t, confidence_ot_t
                             )
 
                             if threshold_test == None:
-                                ubot_feature_t_mix = mixup_target(z_target, device=self.device).to(self.device)
+                                rand_n = min(mixup_samples, len(z_target))
+                                idx_rand_test = torch.randperm(len(z_target), device=self.device)[:rand_n]
+                                ubot_feature_t_mix = mixup_target(z_target[idx_rand_test], device=self.device)
                                 before_lincls_feat_t_mix, logit_t_mix = self.classifier(ubot_feature_t_mix)
                                 norm_feat_t_mix = F.normalize(before_lincls_feat_t_mix)
                                 sim_tar_mix = torch.matmul(norm_feat_t_mix, source_prototype.t())
-                                _, _, _, wt_i_mix = ubot_CCD(sim_tar_mix, beta_s, device=self.device)
+                                _, _, _, wt_i_mix = ubot_CCD(
+                                    sim_tar_mix, beta_s, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
+                                )
                                 confidence_ot_mix = (wt_i_mix - torch.min(wt_i_mix)) / (
-                                    torch.max(wt_i_mix) - torch.min(wt_i_mix)
+                                    torch.max(wt_i_mix) - torch.min(wt_i_mix) + 1e-12
                                 )
                                 Escore_mix_t, _, _, _ = ensemble_score(logit_t_mix, confidence_ot_mix)
                                 threshold_test = torch.mean(Escore_mix_t)
                                 threshold_test = torch.min(
-                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))])
+                                    torch.tensor([threshold_test, torch.quantile(Escore_mix_t, (1 - resolution))], device=self.device)
                                 )
 
                             pred_known_id = torch.nonzero(Escore_t >= threshold_test).view(-1)
@@ -1322,7 +1570,7 @@ class SPANN_model:
                             sim_tar_high_conf = torch.matmul(norm_feat_t[pred_known_id], source_prototype.t())
                             if sim_tar_high_conf.size()[0] > 0:
                                 pseudo_label_t_high_conf, _, _, _ = ubot_CCD(
-                                    sim_tar_high_conf, beta, device=self.device
+                                    sim_tar_high_conf, beta, device=self.device, stopThr=sinkhorn_stop_thr, max_iter=sinkhorn_max_iter
                                 )
                                 pseudo_label_t_ot[pred_known_id] = pseudo_label_t_high_conf
 
@@ -1418,3 +1666,7 @@ class SPANN_model:
         adata_target.obs["source"] = "Spatial"
 
         return adata_source, adata_target, threshold_test
+
+    # Aliases
+    fit = train
+    fit_eval = train_eval

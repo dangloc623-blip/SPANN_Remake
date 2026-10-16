@@ -164,7 +164,7 @@ def generate_dataloaders(adata_cm, adata_spa, adata_rna, batch_size=256, num_wor
 # output: x, domain_id, idx
 
 
-def generate_ae_params(adata_cm, adata_spa, adata_rna, feat_dim=16):
+def generate_ae_params(adata_cm, adata_spa, adata_rna, feat_dim=16, hidden_dim=512):
     """
     Generate default autoencoder parameters from preprocessed spatial and rna data
 
@@ -172,6 +172,7 @@ def generate_ae_params(adata_cm, adata_spa, adata_rna, feat_dim=16):
     :adata_spa: AnnData file of the preprocessed spatial data
     :adata_rna: AnnData file of the preprocessed scRNA-seq data
     :feat_dim: dimension of latent features, default=16
+    :hidden_dim: dimension of encoder hidden layer, default=512 (optimized from 1024 for speed & efficiency)
     :return: encoder_parameters, decoder_parameters, output dimensions, latent dimension
     """
     adatas = [adata_spa, adata_rna]
@@ -182,7 +183,7 @@ def generate_ae_params(adata_cm, adata_spa, adata_rna, feat_dim=16):
         num_gene.append(adata.X.shape[1])
 
     n_domain = len(adatas)
-    enc = [["fc", 1024, 1, "relu"], ["fc", feat_dim, "", ""]]
+    enc = [["fc", hidden_dim, 1, "relu"], ["fc", feat_dim, "", ""]]
     num_gene.append(adata_cm.X.shape[1])
     dec = {}
     dec[0] = [["fc", num_gene[n_domain], n_domain, "sigmoid"]]  # common decoder
